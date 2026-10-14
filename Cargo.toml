@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 mpris = "2.1.0"
+termion = "4.0.6"
