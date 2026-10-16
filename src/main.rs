@@ -46,6 +46,8 @@ enum Action {
   DecreaseVolume,
 }
 
+//uhh ion remember why i changed this variable,
+//i was doing so much random stuff to get inputs working 😭
 type Screen = AlternateScreen<RawTerminal<Stdout>>;
 const REFRESH_INTERVAL: u32 = 100; //100 msec
 
