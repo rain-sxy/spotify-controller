@@ -1,4 +1,4 @@
 [spotify]
-client_id = ""
-client_secret = ""
+client_id = "a43f2dea429d45e5a7eb55f1ab9eeb11"
+client_secret = "16f6d2318e4746b09e3a5cb10b589b63"
 redirect_uri = "http://127.0.0.1:8942/callback"

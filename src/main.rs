@@ -44,6 +44,7 @@ enum Action {
   CycleLoopStatus,
   IncreaseVolume,
   DecreaseVolume,
+  Search,
 }
 
 type Screen = AlternateScreen<RawTerminal<Stdout>>;
@@ -61,6 +62,7 @@ const ACTIONS: &[Action] = &[
   Action::CycleLoopStatus,
   Action::IncreaseVolume,
   Action::DecreaseVolume,
+  Action::Search,
 ];
 
 impl Action {
@@ -80,6 +82,7 @@ impl Action {
       Key::Char('-') => Some(DecreaseVolume),
       Key::Right => Some(SeekForwards),
       Key::Left => Some(SeekBackwards),
+      Key::Char('/') => Some(Search),
       _ => None,
     }
   }
@@ -97,6 +100,7 @@ impl Action {
       Action::SeekBackwards => "Right",
       Action::IncreaseVolume => "+",
       Action::DecreaseVolume => "-",
+      Action::Search => "/",
     }
   }
 
@@ -113,12 +117,13 @@ impl Action {
       Action::SeekBackwards => "Seek 5s backward",
       Action::IncreaseVolume => "Increase volume",
       Action::DecreaseVolume => "Decrease volume",
+      Action::Search => "Search",
     }
   }
 
   fn is_enabled(&self, player: &Player) -> bool {
     match *self {
-      Action::Quit => true,
+      Action::Quit | Action::Search => true,
       Action::PlayPause => player.can_pause().unwrap_or(false),
       Action::Stop => player.can_stop().unwrap_or(false),
       Action::Next => player.can_go_next().unwrap_or(false),
@@ -192,6 +197,11 @@ impl<'a> App<'a> {
       Action::SeekForwards => control_player(self.player.seek_forwards(&Duration::new(5, 0))),
       Action::IncreaseVolume => control_player(change_volume(self.player, 0.1)),
       Action::DecreaseVolume => control_player(change_volume(self.player, -0.1)),
+      Action::Search => {
+        if let Some(search_query) = prompt_for_search(&mut self.screen, &mut self.stdin) {
+          self.search_for(search_query);
+        }
+      }
     };
   }
 
@@ -234,135 +244,131 @@ impl<'a> App<'a> {
   fn supports_position(&self) -> bool {
     self.player.identity() != "Spotify"
   }
+
+  //search for tracks using query
+  fn search_for(&mut self, query: String) {
+    let spotify = self.spotify.clone();
+
+    let search_result = tokio::task::block_in_place(|| {
+      tokio::runtime::Handle::current().block_on(async move {
+        spotify.search(
+          &query,
+          SearchType::Track,
+          None,
+          None,
+          Some(10),
+          None,
+        ).await
+      })
+    });
+
+    let tracks = match search_result {
+      Ok(SearchResult::Tracks(results)) => results.items,
+      Ok(_) => Vec::new(),
+      Err(e) => {
+        eprintln!("Search failed: {}", e);
+        Vec::new()
+      }
+    };
+
+    if tracks.is_empty() {
+      write!(self.screen, "\r\nNo tracks found\r\n").unwrap();
+      self.screen.flush().ok();
+      return;
+    }
+
+    for (i, track) in tracks.iter().enumerate() {
+      let artists: Vec<String> = track.artists.iter().map(|a| a.name.clone()).collect();
+      println!("\r\n {:2}. {} - {}\r\n", i + 1, artists.join(", "), track.name);
+    }
+
+
+    //track selection, this could totally be merged in different function with the
+    //other search stuff but i really cant be asked
+    use termion::event::Key;
+    write!(self.screen, "\r\nEnter track number to play (1-10) or Esc to cancel: ").unwrap();
+    self.screen.flush().ok();
+
+    let mut input_str = String::new();
+    loop {
+      if let Some(Ok(key)) = (&mut self.stdin).keys().next() {
+        match key {
+          Key::Char('\n') => break,
+          Key::Char(ch) => {
+            if ch.is_ascii_digit() {
+              input_str.push(ch);
+              write!(self.screen, "{}", ch).unwrap();
+              self.screen.flush().ok();
+            }
+          }
+          Key::Backspace => {
+            if !input_str.is_empty() {
+              input_str.pop();
+              write!(self.screen, "\x08 \x08").unwrap();
+              self.screen.flush().ok();
+            }
+          }
+          Key::Esc => return,
+          _ => {}
+        }
+      } else {
+        std::thread::sleep(Duration::from_millis(10));
+      }
+    }
+    //play track number that was picked
+    if let Ok(index) = input_str.parse::<usize>() {
+      if index >= 1 && index <= tracks.len().min(10) {
+        let chosen_track = &tracks[index - 1];
+        if let Some(track_id) = chosen_track.id.clone() {
+          let spotify_client = self.spotify.clone();
+
+          let play_track = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+              spotify_client.start_uris_playback(
+                [rspotify::model::PlayableId::Track(track_id.clone())],
+                None,
+                None,
+                None,
+              ).await
+            })
+          });
+        }
+      }
+    }
+  }
 }
 
-//THIS ISNT USED ANYWHERE I CANT FIGURE OUT INPUT AND ITS 1AM PLEASE HELP
-//IT WORKS AS A SEARCH FUNCTION IF I CAN PASS INPUT INTO IT BUT IM TOO TIRED
-//FOR THIS RIGHT NOW :SOB:
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-async fn search() -> Result<(), Box<dyn std::error::Error>> {
-let mut query = String::new();
-    loop {
-        print!("\x1B[2J\x1B[1;1H");
-        println!("Enter search:");
+fn prompt_for_search(screen: &mut Screen, stdin: &mut termion::AsyncReader) -> Option<String> {
+  use termion::event::Key;
+  write!(screen, "\r\nSearch: ").unwrap();
+  screen.flush().ok()?;
 
-        let mut search_input = String::new();
-        std::io::stdin().read_line(&mut search_input)?;
-        query = search_input.trim().to_string();
-
+  let mut query = String::new();
+  loop {
+    if let Some(Ok(key)) = stdin.keys().next() {
+      match key {
+        Key::Char('\n') => break,
+        Key::Char(ch) => {
+        query.push(ch);
+        write!(screen, "{}", ch).unwrap();
+        screen.flush().ok()?;
+      }
+      Key::Backspace => {
         if !query.is_empty() {
-            break;
+          query.pop();
+          write!(screen, "\x08 \x08").unwrap();
+          screen.flush().ok()?;
         }
-
-        println!("Must input search, press Enter to continue");
-        let _ = std::io::stdin().read_line(&mut String::new());
+      }
+        Key::Esc => return None,
+        _ => {}
+      }
+    } else {
+      std::thread::sleep(Duration::from_millis(10));
     }
-
-    let search_result_limit = 10;
-    let mut search_result_offset = 0u32;
-
-    loop {
-        print!("\x1B[2J\x1B[1;1H");
-
-        let search_results = spotify.search(
-        &query,
-        SearchType::Track,
-        None,
-        None,
-        Some(search_result_limit),
-        Some(search_result_offset)
-    ).await?;
-
-        let mut current_tracks = Vec::new();
-        if let SearchResult::Tracks(results) = search_results {
-            println!("found {} results for '{}':", results.total, query);
-
-            if results.items.is_empty() {
-                println!("No tracks found for '{}'", query);
-            }
-            current_tracks = results.items;
-            
-            for (i, track) in current_tracks.iter().enumerate() {
-                let artists: Vec<String> = track.artists.iter().map(|a| a.name.clone()).collect();
-                println!("{}. {} by {}", search_result_offset + i as u32 + 1, track.name, artists.join(", "));
-            }
-
-        }
-
-        println!("\nType a track number to play it, or type 'next', 'prev', 'search', or 'quit':");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let command = input.trim().to_lowercase();
-
-        if let Ok(track_choice) = command.parse::<u32>() {
-            let start_index = search_result_offset + 1;
-            let end_index = search_result_offset + current_tracks.len() as u32;
-
-            if track_choice >= start_index && track_choice <= end_index {
-                let local_index = (track_choice - start_index) as usize;
-                if let Some(track) = current_tracks.get(local_index) {
-                    println!("Playing: {} by {}", track.name, track.artists[0].name);
-
-                    if let Some(track_id) = &track.id {
-                        spotify.start_uris_playback(
-                            [rspotify::model::PlayableId::Track(track_id.clone())],
-                            None,
-                            None,
-                            None,
-                        ).await?;
-                    } else {
-                        println!("Selected track has no valid ID");
-                    }
-                }
-            } else {
-                println!("Selected track out of range");
-            }
-        } else {
-            match command.as_str() {
-                "next" => {
-                    search_result_offset += search_result_limit;
-                }
-                "prev" | "previous" => {
-                    if search_result_offset >= search_result_limit {
-                        search_result_offset -= search_result_limit;
-                    } else {
-                        println!("You are already on the first page");
-                    }
-                }
-                "search" => {
-                    let new_query;
-                    loop{
-                        println!("Enter new search:");
-                        let mut new_search_input = String::new();
-                        std::io::stdin().read_line(&mut new_search_input)?;
-                        let trimmed_search_input = new_search_input.trim().to_string();
-
-                        if !trimmed_search_input.is_empty() {
-                            new_query = trimmed_search_input;
-                            break;
-                        }
-                        println!("Must input search");
-                    }
-                    query = new_query;
-                    search_result_offset = 0;
-                }
-                "quit" | "exit" => {
-                    println!("Quitting controller");
-                    break;
-                }
-                _ => {
-                    println!("Unknown command");
-                }
-            }
-        }
-    }
-    Ok(())
+  }
+  Some(query)
 }
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 fn find_next_track(
   current_track_id: Option<TrackID>,
