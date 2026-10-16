@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 mpris = "2.1.0"
 termion = "4.0.6"
+rspotify = { version = "0.16.1", features = ["cli"] }
+serde = "1.0.229"
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
+toml = "1.1.8"

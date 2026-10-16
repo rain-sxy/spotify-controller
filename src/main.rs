@@ -1,20 +1,35 @@
 use std::borrow::Cow;
 use std::io::{stdout, Stdout, Write};
 use std::time::Duration;
+use std::fs;
 
-use mpris::{
-    LoopStatus, Metadata, PlaybackStatus, Player, PlayerFinder, Progress, ProgressTick,
-    ProgressTracker, TrackID, TrackList,
-};
+use serde::Deserialize;
+
 use termion::color;
 use termion::input::TermRead;
-
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::screen::{AlternateScreen, IntoAlternateScreen};
 
-const REFRESH_INTERVAL: u32 = 100; //100 msec
+use mpris::{
+  LoopStatus, Metadata, PlaybackStatus, Player, PlayerFinder, Progress, ProgressTick,
+  ProgressTracker, TrackID, TrackList,
+};
 
-type Screen = AlternateScreen<RawTerminal<Stdout>>;
+use rspotify::prelude::*;
+use rspotify::{AuthCodeSpotify, Credentials, OAuth, Config};
+use rspotify::model::{SearchType, SearchResult};
+
+#[derive(Deserialize)]
+struct ConfigFile {
+  spotify: SpotifyConfig,
+}
+
+#[derive(Deserialize)]
+struct SpotifyConfig {
+  client_id: String,
+  client_secret: String,
+  redirect_uri: String,
+}
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -30,6 +45,9 @@ enum Action {
   IncreaseVolume,
   DecreaseVolume,
 }
+
+type Screen = AlternateScreen<RawTerminal<Stdout>>;
+const REFRESH_INTERVAL: u32 = 100; //100 msec
 
 const ACTIONS: &[Action] = &[
   Action::Quit,
@@ -84,7 +102,7 @@ impl Action {
 
   fn description(&self) -> &'static str {
     match *self {
-      Action::Quit => "Quit example",
+      Action::Quit => "Quit",
       Action::PlayPause => "Toggle play/pause",
       Action::Stop => "Stop",
       Action::Next => "Next media",
@@ -132,6 +150,7 @@ struct App<'a> {
   progress_tracker: ProgressTracker<'a>,
   stdin: termion::AsyncReader,
   screen: Screen,
+  spotify: AuthCodeSpotify,
 }
 
 impl<'a> App<'a> {
@@ -216,6 +235,134 @@ impl<'a> App<'a> {
     self.player.identity() != "Spotify"
   }
 }
+
+//THIS ISNT USED ANYWHERE I CANT FIGURE OUT INPUT AND ITS 1AM PLEASE HELP
+//IT WORKS AS A SEARCH FUNCTION IF I CAN PASS INPUT INTO IT BUT IM TOO TIRED
+//FOR THIS RIGHT NOW :SOB:
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+async fn search() -> Result<(), Box<dyn std::error::Error>> {
+let mut query = String::new();
+    loop {
+        print!("\x1B[2J\x1B[1;1H");
+        println!("Enter search:");
+
+        let mut search_input = String::new();
+        std::io::stdin().read_line(&mut search_input)?;
+        query = search_input.trim().to_string();
+
+        if !query.is_empty() {
+            break;
+        }
+
+        println!("Must input search, press Enter to continue");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+
+    let search_result_limit = 10;
+    let mut search_result_offset = 0u32;
+
+    loop {
+        print!("\x1B[2J\x1B[1;1H");
+
+        let search_results = spotify.search(
+        &query,
+        SearchType::Track,
+        None,
+        None,
+        Some(search_result_limit),
+        Some(search_result_offset)
+    ).await?;
+
+        let mut current_tracks = Vec::new();
+        if let SearchResult::Tracks(results) = search_results {
+            println!("found {} results for '{}':", results.total, query);
+
+            if results.items.is_empty() {
+                println!("No tracks found for '{}'", query);
+            }
+            current_tracks = results.items;
+            
+            for (i, track) in current_tracks.iter().enumerate() {
+                let artists: Vec<String> = track.artists.iter().map(|a| a.name.clone()).collect();
+                println!("{}. {} by {}", search_result_offset + i as u32 + 1, track.name, artists.join(", "));
+            }
+
+        }
+
+        println!("\nType a track number to play it, or type 'next', 'prev', 'search', or 'quit':");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let command = input.trim().to_lowercase();
+
+        if let Ok(track_choice) = command.parse::<u32>() {
+            let start_index = search_result_offset + 1;
+            let end_index = search_result_offset + current_tracks.len() as u32;
+
+            if track_choice >= start_index && track_choice <= end_index {
+                let local_index = (track_choice - start_index) as usize;
+                if let Some(track) = current_tracks.get(local_index) {
+                    println!("Playing: {} by {}", track.name, track.artists[0].name);
+
+                    if let Some(track_id) = &track.id {
+                        spotify.start_uris_playback(
+                            [rspotify::model::PlayableId::Track(track_id.clone())],
+                            None,
+                            None,
+                            None,
+                        ).await?;
+                    } else {
+                        println!("Selected track has no valid ID");
+                    }
+                }
+            } else {
+                println!("Selected track out of range");
+            }
+        } else {
+            match command.as_str() {
+                "next" => {
+                    search_result_offset += search_result_limit;
+                }
+                "prev" | "previous" => {
+                    if search_result_offset >= search_result_limit {
+                        search_result_offset -= search_result_limit;
+                    } else {
+                        println!("You are already on the first page");
+                    }
+                }
+                "search" => {
+                    let new_query;
+                    loop{
+                        println!("Enter new search:");
+                        let mut new_search_input = String::new();
+                        std::io::stdin().read_line(&mut new_search_input)?;
+                        let trimmed_search_input = new_search_input.trim().to_string();
+
+                        if !trimmed_search_input.is_empty() {
+                            new_query = trimmed_search_input;
+                            break;
+                        }
+                        println!("Must input search");
+                    }
+                    query = new_query;
+                    search_result_offset = 0;
+                }
+                "quit" | "exit" => {
+                    println!("Quitting controller");
+                    break;
+                }
+                _ => {
+                    println!("Unknown command");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 fn find_next_track(
   current_track_id: Option<TrackID>,
@@ -430,8 +577,33 @@ fn format_duration(duration: Duration) -> String {
   format!("{:02}:{:02}:{:02}", whole_hours, whole_minutes, secs)
 }
 
-fn main() {
-  //looks for spotifyd
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+  //connect to spotify
+  let config_str = fs::read_to_string("config.toml")?;
+  let config: ConfigFile = toml::from_str(&config_str)?;
+
+  let creds = Credentials::new(&config.spotify.client_id, &config.spotify.client_secret);
+  let oauth = OAuth {
+    redirect_uri: config.spotify.redirect_uri.clone(),
+    scopes: ["user-modify-playback-state", "user-read-playback-state"]
+      .into_iter()
+      .map(String::from)
+      .collect(),
+      ..OAuth::default()
+  };
+
+  let spotify_config = Config {
+    token_cached: true,
+    ..Config::default()
+  };
+
+  let spotify = AuthCodeSpotify::with_config(creds, oauth, spotify_config);
+  let url = spotify.get_authorize_url(false)?;
+  spotify.prompt_for_token(&url).await?;
+  println!("Connected");
+
+  //look for spotifyd
   let player = PlayerFinder::new()
     .unwrap()
     .find_all()
@@ -456,6 +628,8 @@ fn main() {
     progress_tracker,
     screen,
     stdin: termion::async_stdin(),
+    spotify,
   };
   app.main_loop();
+  Ok(())
 }
