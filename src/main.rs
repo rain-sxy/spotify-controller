@@ -10,6 +10,8 @@ use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::screen::{AlternateScreen, IntoAlternateScreen};
 
+use futures::StreamExt;
+
 use mpris::{
   LoopStatus, Metadata, PlaybackStatus, Player, PlayerFinder, Progress, ProgressTick,
   ProgressTracker, TrackID, TrackList,
@@ -45,6 +47,7 @@ enum Action {
   IncreaseVolume,
   DecreaseVolume,
   Search,
+  Playlists,
 }
 
 //uhh ion remember why i changed this variable,
@@ -65,6 +68,7 @@ const ACTIONS: &[Action] = &[
   Action::IncreaseVolume,
   Action::DecreaseVolume,
   Action::Search,
+  Action::Playlists,
 ];
 
 impl Action {
@@ -85,6 +89,7 @@ impl Action {
       Key::Right => Some(SeekForwards),
       Key::Left => Some(SeekBackwards),
       Key::Char('/') => Some(Search),
+      Key::Char('l') => Some(Playlists),
       _ => None,
     }
   }
@@ -103,6 +108,7 @@ impl Action {
       Action::IncreaseVolume => "+",
       Action::DecreaseVolume => "-",
       Action::Search => "/",
+      Action::Playlists => "l",
     }
   }
 
@@ -120,12 +126,13 @@ impl Action {
       Action::IncreaseVolume => "Increase volume",
       Action::DecreaseVolume => "Decrease volume",
       Action::Search => "Search",
+      Action::Playlists => "View Playlists",
     }
   }
 
   fn is_enabled(&self, player: &Player) -> bool {
     match *self {
-      Action::Quit | Action::Search => true,
+      Action::Quit | Action::Search | Action::Playlists => true,
       Action::PlayPause => player.can_pause().unwrap_or(false),
       Action::Stop => player.can_stop().unwrap_or(false),
       Action::Next => player.can_go_next().unwrap_or(false),
@@ -199,6 +206,7 @@ impl<'a> App<'a> {
       Action::SeekForwards => control_player(self.player.seek_forwards(&Duration::new(5, 0))),
       Action::IncreaseVolume => control_player(change_volume(self.player, 0.1)),
       Action::DecreaseVolume => control_player(change_volume(self.player, -0.1)),
+      Action::Playlists => self.show_playlists(),
       Action::Search => {
         if let Some(search_query) = prompt_for_search(&mut self.screen, &mut self.stdin) {
           self.search_for(search_query);
@@ -338,6 +346,84 @@ impl<'a> App<'a> {
       }
     }
   }
+
+  fn show_playlists(&mut self) {
+    let spotify = self.spotify.clone();
+
+    let playlists_result = tokio::task::block_in_place(|| {
+      tokio::runtime::Handle::current().block_on(async move {
+        spotify.current_user_playlists().collect::<Vec<_>>().await
+      })
+    });
+    let playlists: Vec<_> = match playlists_result.into_iter().collect::<Result<Vec<_>, _>>() {
+      Ok(results) => results,
+      Err(e) => {
+        write!(self.screen, "Failed to fetch playlists: {}", e).ok();
+        return;
+      }
+    };
+
+    if playlists.is_empty() {
+        write!(self.screen, "No playlists found").unwrap();
+    }
+
+    for (i, playlist) in playlists.iter().take(10).enumerate() {
+      write!(self.screen, "\r\n {:2}. {}\r\n", i + 1, playlist.name).ok();
+    }
+    self.screen.flush().ok();
+
+    use termion::event::Key;
+    write!(self.screen, "\r\nEnter track number to play (1-10) or Esc to cancel: ").unwrap();
+    self.screen.flush().ok();
+
+    let mut input_str = String::new();
+    loop {
+      if let Some(Ok(key)) = (&mut self.stdin).keys().next() {
+        match key {
+          Key::Char('\n') => break,
+          Key::Char(ch) => {
+            if ch.is_ascii_digit() {
+              input_str.push(ch);
+              write!(self.screen, "{}", ch).unwrap();
+              self.screen.flush().ok();
+            }
+          }
+          Key::Backspace => {
+            if !input_str.is_empty() {
+              input_str.pop();
+              write!(self.screen, "\x08 \x08").unwrap();
+              self.screen.flush().ok();
+            }
+          }
+          Key::Esc => return,
+          _ => {}
+        }
+      } else {
+        std::thread::sleep(Duration::from_millis(10));
+      }
+    }
+
+    //play selected playlist
+    if let Ok(index) = input_str.parse::<usize>() {
+      if index >= 1 && index <= playlists.len().min(10) {
+        let chosen_playlist = &playlists[index - 1];
+        let playlist_id = chosen_playlist.id.clone();
+        let context_id = PlayContextId::Playlist(playlist_id);
+        let spotify_client = self.spotify.clone();
+
+        let play_playlist = tokio::task::block_in_place(|| {
+          tokio::runtime::Handle::current().block_on(async move {
+            spotify_client.start_context_playback(
+              context_id,
+              None,
+              None,
+              None,
+            ).await
+          })
+        });
+      }
+    }
+  }
 }
 
 fn prompt_for_search(screen: &mut Screen, stdin: &mut termion::AsyncReader) -> Option<String> {
@@ -413,6 +499,16 @@ fn change_volume(player: &Player, diff: f64) -> Result<(), mpris::DBusError> {
   let current_volume = player.get_volume()?;
   let new_volume = (current_volume + diff).max(0.0).min(1.0);
   player.set_volume(new_volume)
+}
+
+fn find_spotifyd_player() -> Player {
+  PlayerFinder::new()
+    .unwrap()
+    .find_all()
+    .expect("Could not find any player")
+    .into_iter()
+    .find(|p| p.identity().to_lowercase().contains("spotifyd"))
+    .expect("Could not find spotifyd daemon")
 }
 
 //////////////////////////////
@@ -594,7 +690,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let creds = Credentials::new(&config.spotify.client_id, &config.spotify.client_secret);
   let oauth = OAuth {
     redirect_uri: config.spotify.redirect_uri.clone(),
-    scopes: ["user-modify-playback-state", "user-read-playback-state"]
+    scopes: ["user-modify-playback-state", "user-read-playback-state", "playlist-read-private", "playlist-read-collaborative"]
       .into_iter()
       .map(String::from)
       .collect(),
@@ -612,15 +708,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("Connected");
 
   //look for spotifyd
-  let player = PlayerFinder::new()
-    .unwrap()
-    .find_all()
-    .expect("Could not find any player")
-    .into_iter()
-    .find(|p| {
-        p.identity().to_lowercase().contains("spotifyd")
-    })
-  .expect("Could not find spotifyd daemon");
+  let player = find_spotifyd_player();
+
   let progress_tracker = player
     .track_progress(REFRESH_INTERVAL)
     .expect("Could not determine progress of player");
