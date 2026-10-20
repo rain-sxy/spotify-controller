@@ -404,6 +404,7 @@ impl<'a> App<'a> {
     }
 
     //play selected playlist
+    //does not work with shuffle aaaaa
     if let Ok(index) = input_str.parse::<usize>() {
       if index >= 1 && index <= playlists.len().min(10) {
         let chosen_playlist = &playlists[index - 1];
