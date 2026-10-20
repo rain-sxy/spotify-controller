@@ -1,4 +1,6 @@
 [spotify]
-client_id = ""
-client_secret = ""
+client_id = "2cd5a4bb117b42f0939879f8af31f6e3"
+client_secret = "68e1280ca54d4bf2bbcb4dab91326651"
 redirect_uri = "http://127.0.0.1:8942/callback"
+
+# well fuck I forgot to remove this :absolutesob:
